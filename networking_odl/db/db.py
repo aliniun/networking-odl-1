@@ -20,6 +20,7 @@ from sqlalchemy.ext import baked
 from sqlalchemy import func
 from sqlalchemy import or_
 from sqlalchemy.orm import aliased
+from sqlalchemy.orm.exc import NoResultFound
 
 from oslo_log import log as logging
 
@@ -138,12 +139,16 @@ def sync_neutron_db_row_status(session, odl_row, status, flush=True):
     """Sync object status to neutron db by object uuid"""
     if odl_row.object_type in NEUTRON_RESOURCES:
         model_getter = getattr(neutron_models_v2, NEUTRON_RESOURCES[odl_row.object_type])
-        neutron_row = session.query(model_getter).filter_by(
-            id=odl_row.object_uuid).one()
-        neutron_row.status = status
-        session.merge(neutron_row)
-        if flush:
-            session.flush()
+        try:
+            neutron_row = session.query(model_getter).filter_by(
+                id=odl_row.object_uuid).one()
+        except NoResultFound:
+            pass
+        else:
+            neutron_row.status = status
+            session.merge(neutron_row)
+            if flush:
+                session.flush()
 
 
 def update_pending_db_row_retry(session, row, retry_count):

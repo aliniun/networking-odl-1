@@ -84,6 +84,8 @@ ODL_CREATE = 'create'
 ODL_UPDATE = 'update'
 ODL_DELETE = 'delete'
 
+ODL_TUNNEL_TYPE = 'vxlan'
+
 # Constants for journal operation states
 PENDING = 'pending'
 PROCESSING = 'processing'

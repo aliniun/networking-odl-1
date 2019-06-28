@@ -75,6 +75,9 @@ class OpenDaylightRestClient(object):
     def get(self, urlpath='', data=None):
         return self.request('get', urlpath, data)
 
+    def post(self, urlpath='', data=None):
+        return self.request('post', urlpath, data)
+
     def put(self, urlpath='', data=None):
         return self.request('put', urlpath, data)
 

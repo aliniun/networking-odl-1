@@ -31,9 +31,12 @@ from oslo_serialization import jsonutils
 from requests import codes
 from requests import exceptions
 
+from neutron.agent import rpc as agent_rpc
 from neutron.db import provisioning_blocks
+from neutron.common import topics
 
 from networking_odl.common import client as odl_client
+from networking_odl.common import constants as odl_const
 from networking_odl.common import odl_features
 from networking_odl.common import utils
 from networking_odl.common import websocket_client as odl_ws_client
@@ -44,10 +47,15 @@ cfg.CONF.import_group('ml2_odl', 'networking_odl.common.config')
 LOG = log.getLogger(__name__)
 
 
+class PseudoAgentApi(agent_rpc.PluginApi):
+    pass
+
+
 class PseudoAgentDBBindingTaskBase(object):
     def __init__(self, worker):
         super(PseudoAgentDBBindingTaskBase, self).__init__()
         self._worker = worker
+        self._agent_rpc = PseudoAgentApi(topics.PLUGIN)
 
         # extract host/port from ODL URL and append hostconf_uri path
         hostconf_uri = utils.get_odl_url(cfg.CONF.ml2_odl.odl_hostconf_uri)
@@ -56,6 +64,12 @@ class PseudoAgentDBBindingTaskBase(object):
         # TODO(mzmalick): disable port-binding for ODL lightweight testing
         self.odl_rest_client = odl_client.OpenDaylightRestClient.create_client(
             url=hostconf_uri)
+
+        hostconf_rpc_uri = utils.get_odl_url(cfg.CONF.ml2_odl.odl_hostconf_rpc_uri)
+        LOG.debug("ODL Tunnel Sync hostconfigs URI: %s", hostconf_rpc_uri)
+
+        self.odl_rpc_client = odl_client.OpenDaylightRestClient.create_client(
+            url=hostconf_rpc_uri)
 
     def _rest_get_hostconfigs(self):
         try:
@@ -91,6 +105,40 @@ class PseudoAgentDBBindingTaskBase(object):
 
         return hostconfigs
 
+    def _rpc_post_hostconfigs(self):
+        try:
+            response = self.odl_rpc_client.post()
+            response.raise_for_status()
+            hostconfigs = response.json()['output']['hostConfig']
+        except exceptions.ConnectionError:
+            LOG.error("Cannot connect to the OpenDaylight Controller",
+                      exc_info=True)
+            return None
+        except exceptions.HTTPError as e:
+            # restconf returns 404 on operation when there is no entry
+            if e.response.status_code == codes.not_found:
+                LOG.debug("Response code not_found (404)"
+                          " treated as an empty list")
+                return []
+
+            LOG.warning("RPCREST/GET odl hostconfig failed, ",
+                        exc_info=True)
+            return None
+        except KeyError:
+            LOG.error("got invalid hostconfigs", exc_info=True)
+            return None
+        except Exception:
+            LOG.warning("RPCREST/GET odl hostconfig failed, ",
+                        exc_info=True)
+            return None
+        else:
+            if LOG.isEnabledFor(logging.DEBUG):
+                _hconfig_str = jsonutils.dumps(
+                    response, sort_keys=True, indent=4, separators=(',', ': '))
+                LOG.debug("ODLTUNNELSYNC hostconfigs:\n%s", _hconfig_str)
+
+        return hostconfigs
+
     def _get_and_update_hostconfigs(self, context=None):
         LOG.info("REST/GET hostconfigs from ODL")
 
@@ -102,6 +150,29 @@ class PseudoAgentDBBindingTaskBase(object):
             return  # retry on next poll
 
         self._worker.update_agents_db(hostconfigs=hostconfigs)
+
+    def _tunnel_sync(self, context=None):
+        LOG.info("RPCREST/GEThostconfigs from ODL")
+
+        hostconfigs = self._rpc_post_hostconfigs()
+
+        if not hostconfigs:
+            LOG.warning("ODL hostconfigs RPCREST/GET failed, "
+                        "will retry on next poll")
+            return
+
+        for host_config in hostconfigs:
+            try:
+                host_name = host_config['binding-host-id']
+                host_ip = host_config['local-ip']
+            except:
+                continue
+
+            LOG.info("Sync Tunnel Endpoint: {0}, {1}.".format(host_name, host_ip))
+            self._agent_rpc.tunnel_sync(context,
+                                        host_ip,
+                                        odl_const.ODL_TUNNEL_TYPE,
+                                        host_name)
 
 
 @registry.has_registry_receivers
@@ -158,6 +229,16 @@ class PseudoAgentDBBindingPeriodicTask(PseudoAgentDBBindingTaskBase):
         self._periodic = periodic_task.PeriodicTask(
             'hostconfig', cfg.CONF.ml2_odl.restconf_poll_interval)
         self._periodic.register_operation(self._get_and_update_hostconfigs)
+        self._periodic.start()
+
+
+class PseudoAgentTunnelSyncPeriodicTask(PseudoAgentDBBindingTaskBase):
+    def __init__(self, worker):
+        super(PseudoAgentTunnelSyncPeriodicTask, self).__init__(worker)
+
+        self._periodic = periodic_task.PeriodicTask(
+            'tunnelsync', cfg.CONF.ml2_odl.restconf_poll_interval)
+        self._periodic.register_operation(self._tunnel_sync)
         self._periodic.start()
 
 
@@ -322,6 +403,33 @@ class PseudoAgentDBBindingWorker(worker.BaseWorker):
             LOG.exception("Unable to delete from agentdb.")
 
 
+class PseudoAgentTunnelSyncWorker(worker.BaseWorker):
+    """Neutron Worker to sync tunnels based on ODL hostconfig."""
+
+    def __init__(self):
+        LOG.info("PseudoAgentTunnelSyncWorker init")
+        super(PseudoAgentTunnelSyncWorker, self).__init__()
+
+    def start(self):
+        LOG.info("PseudoAgentTunnelSyncWorker starting")
+        super(PseudoAgentTunnelSyncWorker, self).start()
+        self._start()
+
+    def stop(self):
+        pass
+
+    def wait(self):
+        pass
+
+    def reset(self):
+        pass
+
+    def _start(self):
+        """Initialization."""
+        LOG.info("Initializing ODL Tunnel Sync Worker")
+        self._periodic_task = (PseudoAgentTunnelSyncPeriodicTask(self))
+
+
 @registry.has_registry_receivers
 class PseudoAgentDBBindingController(port_binding.PortBindingController):
     """Switch agnostic Port binding controller for OpenDayLight."""
@@ -331,13 +439,14 @@ class PseudoAgentDBBindingController(port_binding.PortBindingController):
         LOG.debug("Initializing ODL Port Binding Controller")
         super(PseudoAgentDBBindingController, self).__init__()
         self._worker = PseudoAgentDBBindingWorker()
+        self._tunnel_worker = PseudoAgentTunnelSyncWorker()
 
     @registry.receives(resources.PROCESS, [events.BEFORE_SPAWN])
     def _before_spawn(self, resource, event, trigger, payload=None):
         self._prepopulate = PseudoAgentDBBindingPrePopulate(self._worker)
 
     def get_workers(self):
-        return [self._worker]
+        return [self._worker, self._tunnel_worker]
 
     def _substitute_hconfig_tmpl(self, port_context, hconfig):
         # TODO(mzmalick): Explore options for inlines string splicing of
